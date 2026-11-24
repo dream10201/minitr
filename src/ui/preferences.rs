@@ -129,6 +129,12 @@ impl Preferences {
             })
             .collect();
         subscriptions.push(cx.on_release(|_, cx| send(cx, Command::SettingsClosed)));
+        // Letting the system destroy the window first leaves the framework's own
+        // teardown working on a dead handle.
+        window.on_window_should_close(cx, |window, _| {
+            window.remove_window();
+            false
+        });
 
         let auto_start = autostart::is_enabled();
         let mut this = Self {

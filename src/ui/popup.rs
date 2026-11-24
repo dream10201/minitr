@@ -160,7 +160,8 @@ impl Popup {
 
     pub fn show(&mut self, translate_clipboard: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(handle) = self.handle {
-            handle.show();
+            // Showing re-enters the framework, which may be borrowed here.
+            cx.spawn(async move |_, _| handle.show()).detach();
         }
         window.activate_window();
         if let Some(handle) = self.handle
