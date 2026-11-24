@@ -22,6 +22,7 @@ use gpui_kit::{
 
 use super::{Command, UpdateState, config, restart_into, send};
 use crate::platform::clipboard::{self, Snapshot};
+use crate::platform::input::CopyKey;
 use crate::platform::speech::Speaker;
 use crate::platform::window::Handle;
 use crate::platform::{input, selection};
@@ -248,12 +249,18 @@ impl Popup {
                 }
                 sleep(30).await;
             }
+            // Ctrl+Insert first: it is safe everywhere. Apps that ignore it get Ctrl+C
+            // as the retry, except terminals, where Ctrl+C would interrupt.
+            let retry = match input::foreground_is_terminal() {
+                true => CopyKey::Insert,
+                false => CopyKey::C,
+            };
             let lease = ClipboardLease::take(seen.clone());
-            input::send_copy();
+            input::send_copy(CopyKey::Insert);
 
-            // Only a clipboard write after our Ctrl+C counts: the old content must not
-            // be mistaken for the selection. Slow apps get a second Ctrl+C while they
-            // still have focus.
+            // Only a clipboard write after our shortcut counts: the old content must
+            // not be mistaken for the selection. The retry goes out while the target
+            // still has focus.
             let mut shown = false;
             for attempt in 0..30 {
                 if lease.changed() {
@@ -266,7 +273,7 @@ impl Popup {
                         break;
                     }
                 } else if attempt == 3 {
-                    input::send_copy();
+                    input::send_copy(retry);
                 } else if attempt == 6 {
                     shown = show(cx);
                 }

@@ -1,9 +1,15 @@
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_C, VK_CONTROL, VK_INSERT,
     VK_LWIN, VK_MBUTTON, VK_MENU, VK_RWIN, VK_SHIFT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+};
 
 use crate::hotkey::{Key, Modifiers, Trigger};
 
@@ -45,31 +51,67 @@ pub fn mask_modifier_release() {
     }
 }
 
-/// Window classes of terminals, where Ctrl+C without a selection interrupts the
-/// running program; they all copy on Ctrl+Insert instead.
-const TERMINAL_CLASSES: &[&str] = &[
-    "ConsoleWindowClass",
-    "CASCADIA_HOSTING_WINDOW_CLASS",
-    "mintty",
-    "VirtualConsoleClass",
-    "PuTTY",
-    "org.wezfurlong.wezterm",
-];
+/// Classic console windows are drawn by conhost itself and host no child console.
+const CONSOLE_CLASSES: &[&str] = &["ConsoleWindowClass", "PuTTY", "mintty"];
 
-fn foreground_is_terminal() -> bool {
+/// Whether the foreground app runs a terminal, where Ctrl+C without a selection
+/// interrupts the running program. Modern terminals, Windows Terminal and editors
+/// with an integrated terminal alike, host shells through a pseudoconsole, which
+/// shows up as a `conhost.exe` / `OpenConsole.exe` child of their process.
+pub fn foreground_is_terminal() -> bool {
+    let window = unsafe { GetForegroundWindow() };
     let mut buffer = [0u16; 64];
-    let length = unsafe { GetClassNameW(GetForegroundWindow(), &mut buffer) };
+    let length = unsafe { GetClassNameW(window, &mut buffer) };
     let class = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
-    TERMINAL_CLASSES.contains(&class.as_str())
+    if CONSOLE_CLASSES.contains(&class.as_str()) {
+        return true;
+    }
+    let mut process = 0;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut process)) };
+    process != 0 && hosts_pseudoconsole(process)
+}
+
+fn hosts_pseudoconsole(process: u32) -> bool {
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return false;
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut found = false;
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while more && !found {
+        if entry.th32ParentProcessID == process {
+            let length = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+            found = name.eq_ignore_ascii_case("conhost.exe")
+                || name.eq_ignore_ascii_case("OpenConsole.exe");
+        }
+        more = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    found
+}
+
+/// Which copy shortcut to send. Ctrl+Insert is the CUA copy that browsers, Office,
+/// Qt, WPF, Java and terminals all accept, and it never interrupts a program.
+#[derive(Clone, Copy)]
+pub enum CopyKey {
+    Insert,
+    C,
 }
 
 /// Sends the copy shortcut, first releasing modifiers still physically held so the
 /// target does not receive Ctrl+Alt+C or similar. One atomic batch.
-pub fn send_copy() {
-    let letter = if foreground_is_terminal() {
-        VK_INSERT
-    } else {
-        VK_C
+pub fn send_copy(copy: CopyKey) {
+    let letter = match copy {
+        CopyKey::Insert => VK_INSERT,
+        CopyKey::C => VK_C,
     };
     let mut inputs: Vec<INPUT> = [VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL]
         .into_iter()
