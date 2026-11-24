@@ -21,10 +21,25 @@ use gpui_kit::{
 
 use super::{Command, Config, UpdateState, config, install_update, router, send};
 use crate::hotkey::{Modifier, Trigger};
+use crate::platform::window::Handle;
 use crate::platform::{autostart, input, trigger};
 use crate::settings::{INTERVAL_RANGE, Profile, Settings};
 use crate::translate::Language;
 use crate::{runtime, translate, update};
+
+/// Hides the window before the framework removes it, so the deactivation that
+/// hiding causes arrives while the framework still knows the window.
+fn close(window: &mut Window, cx: &mut App) {
+    let native = Handle::of(window);
+    let handle = window.window_handle();
+    cx.spawn(async move |cx| {
+        if let Some(native) = native {
+            native.hide();
+        }
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    })
+    .detach();
+}
 
 /// Profiles get an identity of their own so rows stay stable while reordered.
 struct Entry {
@@ -131,8 +146,8 @@ impl Preferences {
         subscriptions.push(cx.on_release(|_, cx| send(cx, Command::SettingsClosed)));
         // Letting the system destroy the window first leaves the framework's own
         // teardown working on a dead handle.
-        window.on_window_should_close(cx, |window, _| {
-            window.remove_window();
+        window.on_window_should_close(cx, |window, cx| {
+            close(window, cx);
             false
         });
 
@@ -407,7 +422,7 @@ impl Preferences {
             }
             self.auto_start_saved = self.auto_start;
         }
-        window.remove_window();
+        close(window, cx);
     }
 
     fn render_profiles(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -684,7 +699,7 @@ impl Render for Preferences {
                     .child(
                         Button::new("cancel")
                             .label("取消")
-                            .on_click(|_, window, _| window.remove_window()),
+                            .on_click(|_, window, cx| close(window, cx)),
                     )
                     .child(
                         Button::new("save")
