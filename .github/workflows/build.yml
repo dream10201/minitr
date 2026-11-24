@@ -1,0 +1,75 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("${{ github.ref }}".StartsWith("refs/tags/v") -and "${{ github.ref_name }}".TrimStart("v") -ne $version) {
+            throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Lint
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force publish | Out-Null
+          Copy-Item target/release/MiniTranslation.exe publish/
+          Compress-Archive -Path publish/MiniTranslation.exe -DestinationPath MiniTranslation-win-x64.zip
+          iscc /DMyAppVersion=${{ steps.version.outputs.version }} setup.iss
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: MiniTranslation-win-x64
+          path: |
+            MiniTranslation-win-x64.zip
+            MiniTranslation-Setup.exe
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            MiniTranslation-win-x64.zip
+            MiniTranslation-Setup.exe
+          generate_release_notes: true
