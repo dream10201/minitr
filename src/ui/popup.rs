@@ -26,8 +26,10 @@ use crate::platform::speech::Speaker;
 use crate::platform::window::Handle;
 use crate::platform::{input, selection};
 use crate::runtime;
+use crate::settings::Capture;
 use crate::translate::{Language, Translation, is_mainly_chinese, normalize_input};
 use crate::update::Pending;
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_C, VK_INSERT};
 
 actions!(popup, [Hide, Speak]);
 
@@ -151,8 +153,8 @@ impl Popup {
         // Visible but behind another app: re-capture instead of hiding.
         if self.visible && self.handle.is_some_and(Handle::is_foreground) {
             self.hide(window, cx);
-        } else if settings.auto_translate_selection && settings.is_configured() {
-            self.capture_selection(window, cx);
+        } else if settings.is_configured() && settings.captures().any(Capture::needs_target) {
+            self.capture(window, cx);
         } else {
             self.show(true, window, cx);
         }
@@ -218,23 +220,23 @@ impl Popup {
 
     fn translate_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = config(cx);
-        if !settings.auto_translate_clipboard || !settings.is_configured() {
+        if !settings.captures().any(|c| c == Capture::Clipboard) || !settings.is_configured() {
             return;
         }
-        let sequence = clipboard::sequence_number();
-        if self.clipboard_seen.replace(sequence) == sequence {
-            return;
-        }
-        if let Some(text) = clipboard::text().filter(|text| !text.trim().is_empty()) {
-            self.auto_translate(text.trim(), window, cx);
+        let text = unseen_clipboard_text(&self.clipboard_seen);
+        if !text.is_empty() {
+            self.auto_translate(&text, window, cx);
         }
     }
 
-    /// Reads the selection of the app in front: UI Automation if it answers quickly,
-    /// otherwise a simulated Ctrl+Insert with the user's clipboard put back afterwards.
-    fn capture_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Tries the enabled capture methods in the user's order until one yields text.
+    /// Those reading the app in front must finish before this window takes the focus.
+    fn capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         input::mask_modifier_release();
-        let trigger = config(cx).hot_key;
+        let settings = config(cx);
+        let trigger = settings.hot_key;
+        let methods: Vec<Capture> = settings.captures().collect();
+        let last_target = methods.iter().rposition(|m| m.needs_target());
         let seen = self.clipboard_seen.clone();
         let executor = cx.background_executor().clone();
         let sleep = move |ms| executor.timer(Duration::from_millis(ms));
@@ -244,54 +246,68 @@ impl Popup {
                 this.update_in(cx, |this, window, cx| this.show(false, window, cx))
                     .is_ok()
             };
-            // Must happen before this window takes the focus away from the target.
-            let selected = futures::select! {
-                text = selection::selected_text().fuse() => text.unwrap_or_default(),
-                _ = sleep(300).fuse() => String::new(),
-            };
-            if !selected.is_empty() {
-                show(cx);
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.auto_translate(&selected, window, cx)
-                });
-                return;
-            }
-
-            for _ in 0..10 {
-                if !input::trigger_held(trigger) {
+            let mut shown = false;
+            let mut released = false;
+            let mut text = String::new();
+            for (index, &method) in methods.iter().enumerate() {
+                text = match method {
+                    Capture::Clipboard => unseen_clipboard_text(&seen),
+                    _ if shown => continue,
+                    Capture::Automation => futures::select! {
+                        text = selection::selected_text().fuse() => text.unwrap_or_default(),
+                        _ = sleep(300).fuse() => String::new(),
+                    },
+                    Capture::CtrlInsert | Capture::CtrlC => {
+                        for _ in 0..10 {
+                            if released || !input::trigger_held(trigger) {
+                                break;
+                            }
+                            sleep(30).await;
+                        }
+                        released = true;
+                        let vk = if method == Capture::CtrlC {
+                            VK_C
+                        } else {
+                            VK_INSERT
+                        };
+                        // The last method may wait for slow apps; the window
+                        // appears meanwhile and a late copy still counts.
+                        let last = Some(index) == last_target;
+                        let lease = ClipboardLease::take(seen.clone());
+                        input::send_ctrl(vk);
+                        let mut copied = String::new();
+                        for attempt in 0..if last { 30 } else { 8 } {
+                            if lease.changed() {
+                                if let Some(text) = clipboard::text()
+                                    .map(|text| text.trim().to_owned())
+                                    .filter(|text| !text.is_empty())
+                                {
+                                    seen.set(clipboard::sequence_number());
+                                    copied = text;
+                                    break;
+                                }
+                            } else if attempt == 3 {
+                                input::send_ctrl(vk);
+                            }
+                            if last && attempt == 6 && !shown {
+                                shown = show(cx);
+                            }
+                            sleep(50).await;
+                        }
+                        copied
+                    }
+                };
+                if !text.is_empty() {
                     break;
                 }
-                sleep(30).await;
-            }
-            let lease = ClipboardLease::take(seen.clone());
-            input::send_copy();
-
-            // A clipboard write after our shortcut is the selection. Without one, the
-            // app may already have copied it on select (tmux, PuTTY, some terminals):
-            // content that arrived since the last capture is used instead. Content
-            // already seen is never mistaken for the selection.
-            let unseen_before = lease.sequence != seen.get();
-            let mut shown = false;
-            for attempt in 0..30 {
-                let fallback = !lease.changed() && attempt == 10 && unseen_before;
-                if lease.changed() || fallback {
-                    shown = shown || show(cx);
-                    if let Some(text) = clipboard::text().filter(|text| !text.trim().is_empty()) {
-                        seen.set(clipboard::sequence_number());
-                        let _ = this.update_in(cx, |this, window, cx| {
-                            this.auto_translate(text.trim(), window, cx)
-                        });
-                        break;
-                    }
-                } else if attempt == 3 {
-                    input::send_copy();
-                } else if attempt == 6 {
-                    shown = show(cx);
-                }
-                sleep(50).await;
             }
             if !shown {
                 show(cx);
+            }
+            if !text.is_empty() {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.auto_translate(&text, window, cx)
+                });
             }
         }));
     }
@@ -586,6 +602,15 @@ impl Render for Popup {
             .child(self.measure(window))
             .child(content)
     }
+}
+
+/// Clipboard text that arrived since it was last consumed, which it now is.
+fn unseen_clipboard_text(seen: &Cell<u32>) -> String {
+    let sequence = clipboard::sequence_number();
+    if seen.replace(sequence) == sequence {
+        return String::new();
+    }
+    clipboard::text().map_or_else(String::new, |text| text.trim().to_owned())
 }
 
 fn physical(logical: f32, window: &Window) -> i32 {

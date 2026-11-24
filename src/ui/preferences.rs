@@ -3,6 +3,7 @@ use std::time::Instant;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectState};
@@ -52,18 +53,8 @@ struct Status {
     error: bool,
 }
 
-fn toggles(s: &mut Settings) -> [(&'static str, &'static str, &mut bool); 5] {
+fn toggles(s: &mut Settings) -> [(&'static str, &'static str, &mut bool); 3] {
     [
-        (
-            "clipboard",
-            "显示窗口时自动翻译剪贴板内容",
-            &mut s.auto_translate_clipboard,
-        ),
-        (
-            "selection",
-            "唤出时自动翻译选中的文字",
-            &mut s.auto_translate_selection,
-        ),
         ("focus", "失去焦点时自动隐藏窗口", &mut s.hide_on_focus_lost),
         ("copy", "翻译完成后自动复制译文", &mut s.auto_copy_result),
         ("update", "自动下载更新", &mut s.auto_check_update),
@@ -576,6 +567,75 @@ impl Preferences {
             ))
     }
 
+    fn move_capture(&mut self, from: usize, up: bool, cx: &mut Context<Self>) {
+        let to = if up {
+            from.checked_sub(1)
+        } else {
+            Some(from + 1)
+        };
+        if let Some(to) = to.filter(|&to| to < self.draft.capture.len()) {
+            self.draft.capture.swap(from, to);
+            cx.notify();
+        }
+    }
+
+    fn render_capture(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let last = self.draft.capture.len() - 1;
+        let rows = self.draft.capture.iter().enumerate().map(|(index, step)| {
+            let id = step.method as usize;
+            let tool = |name: &'static str, icon: IconName, tip: &'static str| {
+                Button::new((name, id))
+                    .ghost()
+                    .xsmall()
+                    .icon(icon)
+                    .tooltip(tip)
+            };
+            h_flex()
+                .px_3()
+                .py_1()
+                .gap_1()
+                .child(
+                    div().flex_1().child(
+                        Checkbox::new(("capture", id))
+                            .label(step.method.label())
+                            .checked(step.enabled)
+                            .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                                this.draft.capture[index].enabled = *checked;
+                                cx.notify();
+                            })),
+                    ),
+                )
+                .child(
+                    tool("capture-up", IconName::ChevronUp, "上移（优先尝试）")
+                        .disabled(index == 0)
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.move_capture(index, true, cx)),
+                        ),
+                )
+                .child(
+                    tool("capture-down", IconName::ChevronDown, "下移")
+                        .disabled(index == last)
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.move_capture(index, false, cx)),
+                        ),
+                )
+        });
+        v_flex()
+            .gap_2()
+            .child(
+                v_flex()
+                    .py_1()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .children(rows),
+            )
+            .child(div().text_xs().text_color(theme.muted_foreground).child(
+                "唤出时按顺序尝试已勾选的方式，取到文字即翻译；从托盘打开只读取剪贴板。Ctrl+C 在终端里没有选中文字时会中断正在运行的程序。",
+            ))
+    }
+
     fn render_options(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let language = h_flex()
@@ -658,6 +718,7 @@ impl Render for Preferences {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let profiles = self.render_profiles(cx).into_any_element();
         let trigger = self.render_trigger(window, cx).into_any_element();
+        let capture = self.render_capture(cx).into_any_element();
         let options = self.render_options(cx).into_any_element();
         let about = self.render_about(cx).into_any_element();
         let theme = cx.theme();
@@ -684,6 +745,7 @@ impl Render for Preferences {
                         .gap_6()
                         .child(section("翻译接口", profiles, cx))
                         .child(section("快捷键", trigger, cx))
+                        .child(section("取词方式", capture, cx))
                         .child(section("选项", options, cx))
                         .child(section("关于", about, cx)),
                 ),

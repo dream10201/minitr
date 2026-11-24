@@ -55,13 +55,96 @@ pub fn local_data_dir() -> PathBuf {
         .join("MiniTranslation")
 }
 
+/// A way of reading the text the user means when the window is summoned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Capture {
+    Automation,
+    CtrlInsert,
+    CtrlC,
+    Clipboard,
+}
+
+impl Capture {
+    pub const ALL: [Self; 4] = [
+        Self::Automation,
+        Self::CtrlInsert,
+        Self::CtrlC,
+        Self::Clipboard,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Automation => "系统接口读取选区",
+            Self::CtrlInsert => "模拟 Ctrl+Insert 复制选区",
+            Self::CtrlC => "模拟 Ctrl+C 复制选区",
+            Self::Clipboard => "读取剪贴板新内容",
+        }
+    }
+
+    /// Reads from the app in front, so it only works before this window takes the focus.
+    pub fn needs_target(self) -> bool {
+        self != Self::Clipboard
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureStep {
+    pub method: Capture,
+    pub enabled: bool,
+}
+
+/// Every method exactly once, in the stored order. Without a stored list the
+/// switches of earlier releases decide.
+fn capture_steps(value: &serde_json::Value) -> Vec<CaptureStep> {
+    let mut steps: Vec<CaptureStep> = match value.get("capture").and_then(|v| v.as_array()) {
+        Some(items) => items
+            .iter()
+            .filter_map(|item| CaptureStep::deserialize(item).ok())
+            .collect(),
+        None => {
+            let flag = |key: &str, default: bool| {
+                value.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+            };
+            let selection = flag("autoTranslateSelection", false);
+            let clipboard = flag("autoTranslateClipboard", true);
+            Capture::ALL
+                .map(|method| CaptureStep {
+                    method,
+                    enabled: match method {
+                        Capture::Automation | Capture::CtrlInsert => selection,
+                        Capture::CtrlC => false,
+                        Capture::Clipboard => clipboard,
+                    },
+                })
+                .to_vec()
+        }
+    };
+    let mut seen = Vec::new();
+    steps.retain(|step| {
+        let first = !seen.contains(&step.method);
+        seen.push(step.method);
+        first
+    });
+    for method in Capture::ALL {
+        if !seen.contains(&method) {
+            steps.push(CaptureStep {
+                method,
+                enabled: false,
+            });
+        }
+    }
+    steps
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     /// Ordered by the user; earlier profiles are tried first.
     pub profiles: Vec<Profile>,
-    pub auto_translate_clipboard: bool,
-    pub auto_translate_selection: bool,
+    /// Ordered by the user; enabled methods are tried until one yields text.
+    #[serde(skip_deserializing)]
+    pub capture: Vec<CaptureStep>,
     pub hot_key: Trigger,
     pub double_press_interval_ms: u32,
     pub foreign_language: Language,
@@ -74,8 +157,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             profiles: Vec::new(),
-            auto_translate_clipboard: true,
-            auto_translate_selection: false,
+            capture: capture_steps(&serde_json::Value::Null),
             hot_key: Trigger::default(),
             double_press_interval_ms: 500,
             foreign_language: Language::English,
@@ -91,6 +173,13 @@ pub const INTERVAL_RANGE: std::ops::RangeInclusive<u32> = 100..=2000;
 impl Settings {
     pub fn is_configured(&self) -> bool {
         self.profiles.iter().any(Profile::is_complete)
+    }
+
+    pub fn captures(&self) -> impl Iterator<Item = Capture> + '_ {
+        self.capture
+            .iter()
+            .filter(|step| step.enabled)
+            .map(|step| step.method)
     }
 
     pub fn double_press_interval(&self) -> std::time::Duration {
@@ -132,6 +221,7 @@ impl Settings {
     fn parse(text: &str) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_str(text).ok()?;
         let mut settings: Self = serde_json::from_value(value.clone()).ok()?;
+        settings.capture = capture_steps(&value);
         if settings.profiles.is_empty() {
             // Releases before multi-profile support stored a single endpoint at the top level.
             let legacy: Profile = serde_json::from_value(value).unwrap_or_default();
@@ -171,7 +261,10 @@ mod tests {
         }"#;
         let settings = Settings::parse(json).unwrap();
         assert_eq!(settings.profiles[0].model, "deepseek-chat");
-        assert!(settings.auto_translate_selection && !settings.auto_translate_clipboard);
+        assert_eq!(
+            settings.captures().collect::<Vec<_>>(),
+            [Capture::Automation, Capture::CtrlInsert]
+        );
         assert_eq!(settings.hot_key.to_string(), "CtrlDouble");
         assert_eq!(settings.double_press_interval_ms, 300);
         assert!(settings.is_configured());
@@ -184,6 +277,31 @@ mod tests {
         let settings = Settings::parse(json).unwrap();
         assert_eq!(settings.profiles.len(), 1);
         assert_eq!(settings.profiles[0].display_name(), "qwen3 @ localhost");
+    }
+
+    #[test]
+    fn capture_list_is_completed_and_deduplicated() {
+        let json = r#"{ "capture": [
+            { "method": "clipboard", "enabled": true },
+            { "method": "future", "enabled": true },
+            { "method": "ctrlC", "enabled": true },
+            { "method": "clipboard", "enabled": false }
+        ] }"#;
+        let settings = Settings::parse(json).unwrap();
+        let order: Vec<_> = settings.capture.iter().map(|step| step.method).collect();
+        assert_eq!(
+            order,
+            [
+                Capture::Clipboard,
+                Capture::CtrlC,
+                Capture::Automation,
+                Capture::CtrlInsert
+            ]
+        );
+        assert_eq!(
+            settings.captures().collect::<Vec<_>>(),
+            [Capture::Clipboard, Capture::CtrlC]
+        );
     }
 
     #[test]
@@ -202,6 +320,8 @@ mod tests {
             api_key: "sk".into(),
             model: "gpt-4o-mini".into(),
         });
+        settings.capture.swap(0, 3);
+        settings.capture[1].enabled = true;
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), settings);
         fs::write(&path, "{ broken").unwrap();

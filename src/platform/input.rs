@@ -44,11 +44,9 @@ pub fn mask_modifier_release() {
     }
 }
 
-/// Sends Ctrl+Insert, the CUA copy shortcut. Unlike Ctrl+C it cannot interrupt a
-/// program in a terminal or SSH client when nothing is selected. Modifiers still
-/// physically held are released first so the target does not see Ctrl+Alt+Insert
-/// or similar. One atomic batch.
-pub fn send_copy() {
+/// Sends Ctrl+`vk`. Modifiers still physically held are released first so the
+/// target does not see Ctrl+Alt+Insert or similar. One atomic batch.
+pub fn send_ctrl(vk: VIRTUAL_KEY) {
     let mut inputs: Vec<INPUT> = [VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL]
         .into_iter()
         .filter(|&vk| is_down(vk))
@@ -56,8 +54,8 @@ pub fn send_copy() {
         .collect();
     inputs.extend([
         key(VK_CONTROL, false),
-        key(VK_INSERT, false),
-        key(VK_INSERT, true),
+        key(vk, false),
+        key(vk, true),
         key(VK_CONTROL, true),
     ]);
     send(&inputs);
