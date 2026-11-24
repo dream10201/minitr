@@ -22,7 +22,6 @@ use gpui_kit::{
 
 use super::{Command, UpdateState, config, restart_into, send};
 use crate::platform::clipboard::{self, Snapshot};
-use crate::platform::input::CopyKey;
 use crate::platform::speech::Speaker;
 use crate::platform::window::Handle;
 use crate::platform::{input, selection};
@@ -217,7 +216,7 @@ impl Popup {
     }
 
     /// Reads the selection of the app in front: UI Automation if it answers quickly,
-    /// otherwise a simulated Ctrl+C with the user's clipboard put back afterwards.
+    /// otherwise a simulated Ctrl+Insert with the user's clipboard put back afterwards.
     fn capture_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         input::mask_modifier_release();
         let trigger = config(cx).hot_key;
@@ -249,14 +248,8 @@ impl Popup {
                 }
                 sleep(30).await;
             }
-            // Ctrl+Insert first: it is safe everywhere. Apps that ignore it get Ctrl+C
-            // as the retry, except terminals, where Ctrl+C would interrupt.
-            let retry = match input::foreground_is_terminal() {
-                true => CopyKey::Insert,
-                false => CopyKey::C,
-            };
             let lease = ClipboardLease::take(seen.clone());
-            input::send_copy(CopyKey::Insert);
+            input::send_copy();
 
             // Only a clipboard write after our shortcut counts: the old content must
             // not be mistaken for the selection. The retry goes out while the target
@@ -273,7 +266,7 @@ impl Popup {
                         break;
                     }
                 } else if attempt == 3 {
-                    input::send_copy(retry);
+                    input::send_copy();
                 } else if attempt == 6 {
                     shown = show(cx);
                 }
