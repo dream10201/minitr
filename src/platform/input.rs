@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_INSERT, VK_LWIN,
@@ -45,20 +47,25 @@ pub fn mask_modifier_release() {
 }
 
 /// Sends Ctrl+`vk`. Modifiers still physically held are released first so the
-/// target does not see Ctrl+Alt+Insert or similar. One atomic batch.
+/// target does not see Ctrl+Alt+Insert or similar. Ctrl stays down for a moment
+/// on both sides of the key: input methods and apps that read the live key state
+/// while handling it would otherwise see a bare key and type it.
 pub fn send_ctrl(vk: VIRTUAL_KEY) {
+    const HOLD: Duration = Duration::from_millis(30);
     let mut inputs: Vec<INPUT> = [VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL]
         .into_iter()
         .filter(|&vk| is_down(vk))
         .map(|vk| key(vk, true))
         .collect();
-    inputs.extend([
-        key(VK_CONTROL, false),
-        key(vk, false),
-        key(vk, true),
-        key(VK_CONTROL, true),
-    ]);
+    inputs.push(key(VK_CONTROL, false));
     send(&inputs);
+    // On its own thread so that a cancelled capture cannot leave Ctrl held down.
+    std::thread::spawn(move || {
+        std::thread::sleep(HOLD);
+        send(&[key(vk, false), key(vk, true)]);
+        std::thread::sleep(HOLD);
+        send(&[key(VK_CONTROL, true)]);
+    });
 }
 
 /// Whether the keys or button that fired `trigger` are still held.
