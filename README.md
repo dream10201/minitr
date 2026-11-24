@@ -1,14 +1,14 @@
 # MiniTranslation
 
-迷你 AI 翻译软件：常驻系统托盘，一个热键呼出，中英互译。
+迷你 AI 翻译软件：常驻系统托盘，一个热键呼出，中文与英语（或日、韩、法、德、西、俄语）互译。
 
 翻译由大模型完成，支持任何 OpenAI 接口格式兼容的服务（OpenAI / DeepSeek / Kimi / Ollama 本地模型等）。可配置多个接口，按顺序使用，失败时自动切换。
 
 ## 使用
 
 - `Alt+Q`：显示 / 隐藏窗口，可在设置中改为其他组合键、双击 Ctrl / Alt / Shift 或双击鼠标中键
-- `回车`：翻译（自动判断中译英 / 英译中），`Shift+回车` 换行
-- `Tab`：朗读英文
+- `回车`：翻译（自动判断方向），`Shift+回车` 换行
+- `Tab`：朗读外文
 - `Esc`：隐藏窗口
 
 首次使用请在托盘图标右键菜单打开“设置”，填写 API 地址、API Key 和模型，例如：
@@ -19,7 +19,7 @@
 | OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
 | Ollama（本地） | `http://localhost:11434/v1` | `qwen3` |
 
-配置保存在 `%AppData%\MiniTranslation\settings.json`。
+配置保存在 `%AppData%\MiniTranslation\settings.json`，错误日志在 `%LocalAppData%\MiniTranslation\minits.log`。
 
 ## 下载
 

@@ -5,9 +5,11 @@ use futures::channel::mpsc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
 use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, IconName, IndexPath, Sizable as _, StyledExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -21,6 +23,7 @@ use super::{Command, Config, UpdateState, config, restart_into, router, send};
 use crate::hotkey::{Modifier, Trigger};
 use crate::platform::{autostart, input, trigger};
 use crate::settings::{INTERVAL_RANGE, Profile, Settings};
+use crate::translate::Language;
 use crate::{runtime, translate, update};
 
 /// Profiles get an identity of their own so rows stay stable while reordered.
@@ -62,6 +65,7 @@ pub struct Preferences {
     key: Entity<InputState>,
     model: Entity<InputState>,
     interval: Entity<InputState>,
+    language: Entity<SelectState<Vec<&'static str>>>,
     recorder: FocusHandle,
     held_modifier: Option<Modifier>,
     released: Option<(Modifier, Instant)>,
@@ -101,6 +105,19 @@ impl Preferences {
                 .default_value(draft.double_press_interval().as_millis().to_string())
         });
 
+        let names = Language::ALL.map(Language::name).to_vec();
+        let current = Language::ALL
+            .iter()
+            .position(|l| *l == draft.foreign_language);
+        let language = cx.new(|cx| {
+            SelectState::new(
+                names,
+                current.map(|row| IndexPath::default().row(row)),
+                window,
+                cx,
+            )
+        });
+
         let mut subscriptions: Vec<Subscription> = [&url, &key, &model]
             .into_iter()
             .map(|field| {
@@ -123,6 +140,7 @@ impl Preferences {
             key,
             model,
             interval,
+            language,
             recorder: cx.focus_handle().tab_stop(true),
             held_modifier: None,
             released: None,
@@ -213,7 +231,7 @@ impl Preferences {
         self.set_status("测试中…", false, cx);
         let client = router(cx).client().clone();
         let job = runtime::spawn(async move {
-            translate::translate(&client, "你好", &profile, &mut |_| {}).await
+            translate::translate(&client, "你好", Language::English, &profile, &mut |_| {}).await
         });
         self.testing = Some(cx.spawn(async move |this, cx| {
             let result = job.await;
@@ -357,6 +375,9 @@ impl Preferences {
             .filter(|p| !p.is_blank())
             .collect();
         settings.double_press_interval_ms = self.interval_ms(cx);
+        if let Some(index) = self.language.read(cx).selected_index(cx) {
+            settings.foreign_language = Language::ALL[index.row.min(Language::ALL.len() - 1)];
+        }
         // The live trigger is suspended while this window is open, so a failure here
         // means another program holds the combination.
         if let Err(error) =
@@ -530,7 +551,19 @@ impl Preferences {
     }
 
     fn render_options(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut column = v_flex().gap_3();
+        let theme = cx.theme();
+        let language = h_flex()
+            .gap_2()
+            .child(div().w(px(160.)).child(Select::new(&self.language)))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("中文译为此语言，其他语言译为中文"),
+            );
+        let mut column = v_flex()
+            .gap_3()
+            .child(field_row("互译语言", language.into_any_element()));
         for (index, (id, label, checked)) in toggles(&mut self.draft).into_iter().enumerate() {
             column = column.child(Switch::new(id).label(label).checked(*checked).on_change(
                 cx.listener(move |this, checked: &bool, _, cx| {

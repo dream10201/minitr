@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -6,14 +6,15 @@ use anyhow::{Result, anyhow, bail};
 use reqwest::Client;
 
 use crate::settings::Profile;
-use crate::translate::{self, Translation};
+use crate::translate::{self, Language, Translation};
 
 const PROBE_FIRST_DELAY: Duration = Duration::from_secs(60);
 const PROBE_MAX_DELAY: Duration = Duration::from_secs(60 * 60);
 const PROBE_CYCLE: Duration = Duration::from_secs(24 * 60 * 60);
+const CACHE_SIZE: usize = 50;
 
 /// Fails over between profiles in the user's order. A failing profile is benched
-/// until a background probe sees it answer again.
+/// until a background probe sees it answer again. Recent results are reused.
 pub struct Router {
     client: Client,
     state: Mutex<State>,
@@ -24,6 +25,8 @@ struct State {
     profiles: Arc<[Profile]>,
     benched: HashSet<Profile>,
     probing: HashSet<Profile>,
+    /// Most recent first.
+    cache: VecDeque<((String, Language), Translation)>,
 }
 
 impl Router {
@@ -48,6 +51,9 @@ impl Router {
             .collect();
         let mut state = self.lock();
         state.benched.retain(|p| complete.contains(p));
+        if state.profiles != complete {
+            state.cache.clear();
+        }
         state.profiles = complete;
     }
 
@@ -59,10 +65,18 @@ impl Router {
     pub async fn translate(
         self: &Arc<Self>,
         text: &str,
+        language: Language,
         mut on_progress: impl FnMut(&str) + Send,
     ) -> Result<Translation> {
+        let key = (text.to_owned(), language);
         let candidates: Vec<Profile> = {
-            let state = self.lock();
+            let mut state = self.lock();
+            if let Some(index) = state.cache.iter().position(|(k, _)| *k == key) {
+                let entry = state.cache.remove(index).expect("index is in bounds");
+                let translation = entry.1.clone();
+                state.cache.push_front(entry);
+                return Ok(translation);
+            }
             let healthy: Vec<_> = state
                 .profiles
                 .iter()
@@ -82,12 +96,18 @@ impl Router {
 
         let mut last_error = None;
         for profile in &candidates {
-            match translate::translate(&self.client, text, profile, &mut on_progress).await {
+            match translate::translate(&self.client, text, language, profile, &mut on_progress)
+                .await
+            {
                 Ok(translation) => {
-                    self.lock().benched.remove(profile);
+                    let mut state = self.lock();
+                    state.benched.remove(profile);
+                    state.cache.push_front((key, translation.clone()));
+                    state.cache.truncate(CACHE_SIZE);
                     return Ok(translation);
                 }
                 Err(error) => {
+                    log::warn!("{} failed: {error:#}", profile.display_name());
                     on_progress("");
                     self.bench(profile);
                     last_error = Some(error);
@@ -121,7 +141,7 @@ impl Router {
                     break;
                 }
             }
-            if translate::translate(&self.client, "hi", &profile, &mut |_| {})
+            if translate::translate(&self.client, "hi", Language::English, &profile, &mut |_| {})
                 .await
                 .is_ok()
             {
@@ -207,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn fails_over_and_benches_the_broken_profile() {
         let (broken, broken_hits) = serve("500 Internal Server Error", "boom").await;
-        let (healthy, _) = serve(
+        let (healthy, healthy_hits) = serve(
             "200 OK",
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
         )
@@ -217,31 +237,57 @@ mod tests {
             client,
             &[profile(&broken), Profile::default(), profile(&healthy)],
         );
+        let english = Language::English;
 
         let mut seen = Vec::new();
         let translation = router
-            .translate("你好", |partial| seen.push(partial.to_owned()))
+            .translate("你好", english, |partial| seen.push(partial.to_owned()))
             .await
             .unwrap();
         assert_eq!(translation.text, "Hello");
         assert!(translation.source_is_chinese);
         assert_eq!(seen, ["", "Hello"], "failover clears partial output first");
 
-        router.translate("你好", |_| {}).await.unwrap();
+        router.translate("再见", english, |_| {}).await.unwrap();
         assert_eq!(
             broken_hits.load(Ordering::SeqCst),
             1,
             "benched profile is skipped"
         );
+        assert_eq!(healthy_hits.load(Ordering::SeqCst), 2);
+
+        router.translate("你好", english, |_| {}).await.unwrap();
+        assert_eq!(
+            healthy_hits.load(Ordering::SeqCst),
+            2,
+            "repeat comes from the cache"
+        );
+        router
+            .translate("你好", Language::Japanese, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            healthy_hits.load(Ordering::SeqCst),
+            3,
+            "cache is per language"
+        );
 
         router.set_profiles(&[profile(&broken)]);
-        let error = router.translate("你好", |_| {}).await.unwrap_err();
+        let error = router
+            .translate("你好", Language::English, |_| {})
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("500"), "{error:#}");
     }
 
     #[tokio::test]
     async fn refuses_without_complete_profiles() {
         let router = Router::new(Client::new(), &[Profile::default()]);
-        assert!(router.translate("hi", |_| {}).await.is_err());
+        assert!(
+            router
+                .translate("hi", Language::English, |_| {})
+                .await
+                .is_err()
+        );
     }
 }

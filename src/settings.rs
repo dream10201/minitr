@@ -4,6 +4,7 @@ use std::{fs, io};
 use serde::{Deserialize, Serialize};
 
 use crate::hotkey::Trigger;
+use crate::translate::Language;
 
 /// One OpenAI-compatible endpoint.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,6 +48,13 @@ fn host_of(url: &str) -> &str {
     }
 }
 
+/// Machine-local data: unpacked updates and the log.
+pub fn local_data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("MiniTranslation")
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -56,6 +64,7 @@ pub struct Settings {
     pub auto_translate_selection: bool,
     pub hot_key: Trigger,
     pub double_press_interval_ms: u32,
+    pub foreign_language: Language,
     pub hide_on_focus_lost: bool,
     pub auto_check_update: bool,
     pub auto_copy_result: bool,
@@ -69,6 +78,7 @@ impl Default for Settings {
             auto_translate_selection: false,
             hot_key: Trigger::default(),
             double_press_interval_ms: 500,
+            foreign_language: Language::English,
             hide_on_focus_lost: false,
             auto_check_update: true,
             auto_copy_result: false,
@@ -90,6 +100,7 @@ impl Settings {
         std::time::Duration::from_millis(ms.into())
     }
 
+    /// Roaming: follows the user across machines.
     pub fn path() -> PathBuf {
         let base = std::env::var_os("APPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
         base.join("MiniTranslation").join("settings.json")

@@ -26,7 +26,7 @@ use crate::platform::speech::Speaker;
 use crate::platform::window::Handle;
 use crate::platform::{input, selection};
 use crate::runtime;
-use crate::translate::{Translation, is_mainly_chinese, normalize_input};
+use crate::translate::{Language, Translation, is_mainly_chinese, normalize_input};
 
 actions!(popup, [Hide, Speak]);
 
@@ -61,12 +61,15 @@ pub struct Popup {
     /// Normalized text of the current or last translation.
     source: String,
     output: SharedString,
+    /// Language of the current or last translation.
+    language: Language,
+    /// The non-Chinese side of the last translation.
     speak_text: Option<String>,
     notice: Option<SharedString>,
     pinned: bool,
     visible: bool,
-    placed: bool,
     speaker: Speaker,
+    speech: Option<Task<()>>,
     /// Clipboard sequence number already consumed, so showing the window only
     /// translates content that is new since.
     clipboard_seen: Rc<Cell<u32>>,
@@ -124,12 +127,13 @@ impl Popup {
             phase: Phase::Idle,
             source: String::new(),
             output: SharedString::default(),
+            language: Language::default(),
             speak_text: None,
             notice: None,
             pinned: false,
             visible: false,
-            placed: false,
             speaker: Speaker::new(),
+            speech: None,
             clipboard_seen: Rc::default(),
             fitted: Rc::default(),
             translation: None,
@@ -157,10 +161,10 @@ impl Popup {
         }
         window.activate_window();
         if let Some(handle) = self.handle
-            && !std::mem::replace(&mut self.placed, true)
+            && !self.visible
         {
             // Queued behind the activation, which applies the framework's own
-            // initial placement first.
+            // initial placement the first time.
             let (width, measured) = self.fitted.get();
             let width = width.max(physical(WIDTH, window));
             let height = measured.max(physical(MIN_HEIGHT, window));
@@ -179,6 +183,7 @@ impl Popup {
     }
 
     pub fn hide(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.speech = None;
         self.speaker.stop();
         self.capture = None;
         // A half-streamed translation is useless later; a finished one is kept so
@@ -283,7 +288,10 @@ impl Popup {
     /// Reuses the finished translation when the text has not changed.
     fn auto_translate(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.set_input(text, window, cx);
-        if matches!(self.phase, Phase::Done) && normalize_input(text) == self.source {
+        if matches!(self.phase, Phase::Done)
+            && normalize_input(text) == self.source
+            && self.language == config(cx).foreign_language
+        {
             cx.notify();
             return;
         }
@@ -306,7 +314,9 @@ impl Popup {
             return;
         }
 
+        let language = config(cx).foreign_language;
         self.source = text.clone();
+        self.language = language;
         self.phase = Phase::Translating;
         self.output = SharedString::default();
         self.speak_text = None;
@@ -316,7 +326,7 @@ impl Popup {
         let (progress, mut updates) = mpsc::unbounded::<String>();
         let job = runtime::spawn(async move {
             router
-                .translate(&text, move |partial| {
+                .translate(&text, language, move |partial: &str| {
                     let _ = progress.unbounded_send(partial.to_owned());
                 })
                 .await
@@ -369,10 +379,14 @@ impl Popup {
         }
     }
 
-    fn speak(&self) {
-        if let Some(text) = &self.speak_text {
-            self.speaker.speak(text);
-        }
+    fn speak(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = &self.speak_text else { return };
+        let speaking = self.speaker.speak(text, self.language.tag());
+        self.speech = Some(cx.spawn(async move |_, _| {
+            if let Err(error) = speaking.await {
+                log::warn!("speech failed: {error}");
+            }
+        }));
     }
 
     /// Sizes the native window to the content. The canvas fills a wrapper without
@@ -422,9 +436,10 @@ impl Popup {
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let text = self.input.read(cx).value();
+        let foreign = config(cx).foreign_language.abbreviation();
         let direction = (!text.trim().is_empty()).then(|| match is_mainly_chinese(&text) {
-            true => "中 → 英",
-            false => "英 → 中",
+            true => format!("中 → {foreign}"),
+            false => format!("{foreign} → 中"),
         });
         let status: Option<SharedString> = match &self.phase {
             Phase::Translating => Some("翻译中…".into()),
@@ -447,9 +462,9 @@ impl Popup {
                     .ghost()
                     .xsmall()
                     .icon(Lucide::Volume2)
-                    .tooltip("朗读英文 (Tab)")
+                    .tooltip("朗读 (Tab)")
                     .disabled(self.speak_text.is_none())
-                    .on_click(cx.listener(|this, _, _, _| this.speak())),
+                    .on_click(cx.listener(|this, _, _, cx| this.speak(cx))),
             )
             .child(
                 Button::new("copy")
@@ -533,7 +548,7 @@ impl Render for Popup {
         div()
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &Hide, window, cx| this.hide(window, cx)))
-            .on_action(cx.listener(|this, _: &Speak, _, _| this.speak()))
+            .on_action(cx.listener(|this, _: &Speak, _, cx| this.speak(cx)))
             .relative()
             .w(px(WIDTH))
             .child(self.measure(window))

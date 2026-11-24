@@ -57,10 +57,7 @@ pub fn enabled() -> bool {
 
 /// `%LocalAppData%\MiniTranslation\app\<version>\MiniTranslation.exe`
 fn versions_dir() -> PathBuf {
-    env::var_os("LOCALAPPDATA")
-        .map_or_else(env::temp_dir, PathBuf::from)
-        .join("MiniTranslation")
-        .join("app")
+    crate::settings::local_data_dir().join("app")
 }
 
 static BASE_EXE: OnceLock<PathBuf> = OnceLock::new();
@@ -170,6 +167,8 @@ struct Release {
 struct Asset {
     name: String,
     browser_download_url: String,
+    /// `sha256:<hex>`, published by GitHub for every asset.
+    digest: Option<String>,
 }
 
 /// Downloads and unpacks a newer release if one exists. `on_progress` gets percentages.
@@ -220,8 +219,23 @@ pub async fn check_and_download(
         }
     }
 
+    let expected = asset
+        .digest
+        .as_deref()
+        .and_then(|d| d.strip_prefix("sha256:"));
+    if expected.is_some_and(|hash| !hash.eq_ignore_ascii_case(&sha256_hex(&archive))) {
+        bail!("更新包校验失败");
+    }
     let exe = tokio::task::spawn_blocking(move || unpack(&archive, version)).await??;
     Ok(Some(Pending { version, exe }))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Unpacks into a staging directory first so a half-written version is never picked up.
@@ -256,6 +270,14 @@ mod tests {
         assert!(Version::parse("staging").is_none());
         assert!(Version::parse("1").is_none());
         assert!(Version::parse("1.2.3.4.5").is_none());
+    }
+
+    #[test]
+    fn hashes_as_lowercase_hex() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

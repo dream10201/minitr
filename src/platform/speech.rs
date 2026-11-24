@@ -1,52 +1,73 @@
-use windows::Win32::Media::Speech::{
-    ISpObjectToken, ISpObjectTokenCategory, ISpVoice, SPCAT_VOICES, SPF_ASYNC, SPF_IS_NOT_XML,
-    SPF_PURGEBEFORESPEAK, SpObjectTokenCategory, SpVoice,
-};
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
-use windows::core::{HSTRING, PCWSTR, w};
+use std::future::Future;
 
-/// SAPI text-to-speech. Lives on the UI thread, which is already a COM apartment.
-pub struct Speaker(Option<ISpVoice>);
+use windows::Media::Core::MediaSource;
+use windows::Media::Playback::MediaPlayer;
+use windows::Media::SpeechSynthesis::{SpeechSynthesizer, VoiceInformation};
+use windows::core::{HSTRING, Result};
+
+/// Text-to-speech with the system's natural voices.
+pub struct Speaker {
+    engine: Option<(SpeechSynthesizer, MediaPlayer)>,
+}
 
 impl Speaker {
-    /// Without a speech engine every call is a no-op.
+    /// Without speech support every call is a no-op.
     pub fn new() -> Self {
-        let voice: Option<ISpVoice> = unsafe { CoCreateInstance(&SpVoice, None, CLSCTX_ALL) }.ok();
-        if let (Some(voice), Some(english)) = (&voice, english_voice()) {
-            let _ = unsafe { voice.SetVoice(&english) };
+        let engine = SpeechSynthesizer::new().and_then(|s| Ok((s, MediaPlayer::new()?)));
+        if let Err(error) = &engine {
+            log::warn!("speech unavailable: {error}");
         }
-        Self(voice)
+        Self {
+            engine: engine.ok(),
+        }
     }
 
-    /// Interrupts anything still being spoken.
-    pub fn speak(&self, text: &str) {
+    /// Interrupts anything still playing, then speaks `text` with a voice for the
+    /// BCP 47 `language` if one is installed. Dropping the future before it
+    /// completes abandons the synthesis.
+    pub fn speak(&self, text: &str, language: &str) -> impl Future<Output = Result<()>> + 'static {
+        self.stop();
+        let engine = self.engine.clone();
         let text = HSTRING::from(text);
-        self.say(PCWSTR(text.as_ptr()));
+        let language = language.to_owned();
+        async move {
+            let Some((synthesizer, player)) = engine else {
+                return Ok(());
+            };
+            if let Some(voice) = voice_for(&language)? {
+                synthesizer.SetVoice(&voice)?;
+            }
+            let stream = synthesizer.SynthesizeTextToStreamAsync(&text)?.await?;
+            let source = MediaSource::CreateFromStream(&stream, &stream.ContentType()?)?;
+            player.SetSource(&source)?;
+            player.Play()
+        }
     }
 
     pub fn stop(&self) {
-        self.say(PCWSTR::null());
-    }
-
-    fn say(&self, text: PCWSTR) {
-        if let Some(voice) = &self.0 {
-            let flags = (SPF_ASYNC.0 | SPF_PURGEBEFORESPEAK.0 | SPF_IS_NOT_XML.0) as u32;
-            let _ = unsafe { voice.Speak(text, flags, None) };
+        if let Some((_, player)) = &self.engine {
+            let _ = player.Pause();
         }
     }
 }
 
-/// Spoken text is always English; on a Chinese system the default voice reads it poorly.
-fn english_voice() -> Option<ISpObjectToken> {
-    unsafe {
-        let category: ISpObjectTokenCategory =
-            CoCreateInstance(&SpObjectTokenCategory, None, CLSCTX_ALL).ok()?;
-        category.SetId(SPCAT_VOICES, false).ok()?;
-        let tokens = category
-            .EnumTokens(w!("Language=409"), PCWSTR::null())
-            .ok()?;
-        let mut token = None;
-        tokens.Next(1, &mut token, None).ok()?;
-        token
+/// Exact region first (`en-US`), then any voice of the same language (`en-GB`).
+fn voice_for(language: &str) -> Result<Option<VoiceInformation>> {
+    let primary = language.split('-').next().unwrap_or(language);
+    let mut fallback = None;
+    for voice in SpeechSynthesizer::AllVoices()? {
+        let tag = voice.Language()?.to_string();
+        if tag.eq_ignore_ascii_case(language) {
+            return Ok(Some(voice));
+        }
+        if fallback.is_none()
+            && tag
+                .split('-')
+                .next()
+                .is_some_and(|p| p.eq_ignore_ascii_case(primary))
+        {
+            fallback = Some(voice);
+        }
     }
+    Ok(fallback)
 }

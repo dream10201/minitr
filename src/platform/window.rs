@@ -58,9 +58,10 @@ impl Handle {
     }
 
     /// Resizes the client area (physical pixels) and keeps the whole window inside
-    /// the work area. With `center`, places it horizontally centered in the upper
-    /// part of the monitor under the cursor instead of where it was.
-    pub fn fit(self, width: i32, height: i32, center: bool) {
+    /// the work area. With `near_cursor`, also moves it just below the mouse
+    /// pointer, or above it when there is no room below.
+    pub fn fit(self, width: i32, height: i32, near_cursor: bool) {
+        const GAP: i32 = 16;
         let hwnd = self.hwnd();
         let (mut outer, mut client) = (RECT::default(), RECT::default());
         unsafe {
@@ -72,9 +73,8 @@ impl Handle {
         let width = width + (outer.right - outer.left) - (client.right - client.left);
         let height = height + (outer.bottom - outer.top) - (client.bottom - client.top);
 
-        let monitor = if center {
-            let mut cursor = POINT::default();
-            let _ = unsafe { GetCursorPos(&mut cursor) };
+        let mut cursor = POINT::default();
+        let monitor = if near_cursor && unsafe { GetCursorPos(&mut cursor) }.is_ok() {
             unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) }
         } else {
             unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
@@ -82,11 +82,14 @@ impl Handle {
         let Some(work) = work_area(monitor) else {
             return;
         };
-        let (x, y) = if center {
-            (
-                work.left + (work.right - work.left - width) / 2,
-                work.top + (work.bottom - work.top - height) / 4,
-            )
+        let (x, y) = if near_cursor {
+            let below = cursor.y + GAP;
+            let y = if below + height <= work.bottom {
+                below
+            } else {
+                cursor.y - GAP - height
+            };
+            (cursor.x - width / 2, y)
         } else {
             (outer.left, outer.top)
         };

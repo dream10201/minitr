@@ -2,6 +2,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod hotkey;
+mod logging;
 mod router;
 mod runtime;
 mod settings;
@@ -15,6 +16,7 @@ mod ui;
 
 #[cfg(windows)]
 fn main() {
+    logging::init();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--sync-base") {
         update::sync_base();

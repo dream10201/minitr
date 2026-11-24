@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 
 use crate::settings::Profile;
@@ -21,22 +21,90 @@ pub fn http_client() -> Client {
         .expect("system TLS backend is available")
 }
 
+/// The language paired with Chinese: Chinese text is translated into it, anything
+/// else into Chinese.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Language {
+    #[default]
+    English,
+    Japanese,
+    Korean,
+    French,
+    German,
+    Spanish,
+    Russian,
+}
+
+impl Language {
+    pub const ALL: [Self; 7] = [
+        Self::English,
+        Self::Japanese,
+        Self::Korean,
+        Self::French,
+        Self::German,
+        Self::Spanish,
+        Self::Russian,
+    ];
+
+    /// `(code, Chinese name, one-character abbreviation, BCP 47 tag)`
+    fn info(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::English => ("en", "英语", "英", "en-US"),
+            Self::Japanese => ("ja", "日语", "日", "ja-JP"),
+            Self::Korean => ("ko", "韩语", "韩", "ko-KR"),
+            Self::French => ("fr", "法语", "法", "fr-FR"),
+            Self::German => ("de", "德语", "德", "de-DE"),
+            Self::Spanish => ("es", "西班牙语", "西", "es-ES"),
+            Self::Russian => ("ru", "俄语", "俄", "ru-RU"),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        self.info().1
+    }
+
+    pub fn abbreviation(self) -> &'static str {
+        self.info().2
+    }
+
+    pub fn tag(self) -> &'static str {
+        self.info().3
+    }
+}
+
+impl Serialize for Language {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.info().0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Language {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let code = String::deserialize(deserializer)?;
+        Ok(Self::ALL
+            .into_iter()
+            .find(|l| l.info().0 == code)
+            .unwrap_or_default())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Translation {
     pub text: String,
     pub source_is_chinese: bool,
 }
 
-/// Streams a translation of `text` (already normalized) between Chinese and English.
-/// `on_progress` receives the full text generated so far after every delta.
+/// Streams a translation of `text` (already normalized) between Chinese and `language`.
+/// `on_progress` receives the full visible text generated so far after every delta.
 pub async fn translate(
     client: &Client,
     text: &str,
+    language: Language,
     profile: &Profile,
     on_progress: &mut (impl FnMut(&str) + Send),
 ) -> Result<Translation> {
     let source_is_chinese = is_mainly_chinese(text);
-    let body = request_body(&profile.model, &prompt(text, source_is_chinese));
+    let body = request_body(&profile.model, &prompt(text, source_is_chinese, language));
     let request = client
         .post(endpoint(&profile.api_base_url))
         .bearer_auth(profile.api_key.trim())
@@ -60,14 +128,14 @@ pub async fn translate(
     let mut stream = ChatStream::default();
     while let Some(chunk) = response.chunk().await.map_err(describe)? {
         if stream.push(&chunk)? {
-            on_progress(&stream.content);
+            on_progress(without_reasoning(&stream.content));
         }
         if stream.done {
             break;
         }
     }
     let content = stream.finish()?;
-    let text = content.trim();
+    let text = without_reasoning(&content).trim();
     if text.is_empty() {
         bail!("接口返回了空结果。");
     }
@@ -93,7 +161,11 @@ fn describe(error: reqwest::Error) -> anyhow::Error {
 
 /// Chinese characters carry more meaning each, so they outvote Latin letters 3:1:
 /// Chinese prose sprinkled with English terms is still Chinese.
+/// Kana marks Japanese, whose kanji would otherwise count as Chinese.
 pub fn is_mainly_chinese(text: &str) -> bool {
+    if text.chars().any(|c| matches!(c, '\u{3040}'..='\u{30FF}')) {
+        return false;
+    }
     let (zh, en) = text.chars().fold((0usize, 0usize), |(zh, en), c| match c {
         '\u{4E00}'..='\u{9FFF}' => (zh + 1, en),
         c if c.is_ascii_alphabetic() => (zh, en + 1),
@@ -125,10 +197,27 @@ pub fn normalize_input(raw: &str) -> String {
 }
 
 /// Prompt template of Tencent Hunyuan-MT, which general chat models follow just as well.
-fn prompt(text: &str, source_is_chinese: bool) -> String {
+/// Reasoning models served through some OpenAI-compatible gateways put their
+/// thinking inline as a leading `<think>…</think>` block.
+fn without_reasoning(content: &str) -> &str {
+    const OPEN: &str = "<think>";
+    let trimmed = content.trim_start();
+    if let Some(rest) = trimmed.strip_prefix(OPEN) {
+        return rest
+            .split_once("</think>")
+            .map_or("", |(_, answer)| answer.trim_start());
+    }
+    if !trimmed.is_empty() && OPEN.starts_with(trimmed) {
+        return "";
+    }
+    content
+}
+
+fn prompt(text: &str, source_is_chinese: bool, language: Language) -> String {
     let text = text.trim();
     if source_is_chinese {
-        format!("将以下文本翻译为 英语，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}")
+        let target = language.name();
+        format!("将以下文本翻译为 {target}，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}")
     } else {
         format!(
             "Translate the following text into Simplified Chinese. Note that you should only \
@@ -288,6 +377,33 @@ mod tests {
         assert!(!is_mainly_chinese("Hello world"));
         assert!(!is_mainly_chinese("A long English sentence with 一 word"));
         assert!(!is_mainly_chinese("12345"));
+        assert!(!is_mainly_chinese("日本語を勉強します"));
+    }
+
+    #[test]
+    fn strips_inline_reasoning() {
+        assert_eq!(without_reasoning("<think>hmm</think>\n\nHello"), "Hello");
+        assert_eq!(without_reasoning("  <think>still thinking"), "");
+        assert_eq!(without_reasoning("<thi"), "");
+        assert_eq!(without_reasoning("Hello <think>"), "Hello <think>");
+    }
+
+    #[test]
+    fn prompt_names_the_target_language() {
+        assert!(prompt("你好", true, Language::Japanese).contains("翻译为 日语"));
+        assert!(prompt("hola", false, Language::Spanish).contains("Simplified Chinese"));
+    }
+
+    #[test]
+    fn language_codes_round_trip() {
+        for language in Language::ALL {
+            let json = serde_json::to_string(&language).unwrap();
+            assert_eq!(serde_json::from_str::<Language>(&json).unwrap(), language);
+        }
+        assert_eq!(
+            serde_json::from_str::<Language>("\"xx\"").unwrap(),
+            Language::English
+        );
     }
 
     #[test]

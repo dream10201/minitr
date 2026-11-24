@@ -1,8 +1,9 @@
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_C, VK_CONTROL, VK_LWIN, VK_MBUTTON, VK_MENU,
-    VK_RWIN, VK_SHIFT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_C, VK_CONTROL, VK_INSERT,
+    VK_LWIN, VK_MBUTTON, VK_MENU, VK_RWIN, VK_SHIFT,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow};
 
 use crate::hotkey::{Key, Modifiers, Trigger};
 
@@ -11,16 +12,21 @@ fn is_down(vk: VIRTUAL_KEY) -> bool {
 }
 
 fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+    let mut flags = if up {
+        KEYEVENTF_KEYUP
+    } else {
+        KEYBD_EVENT_FLAGS(0)
+    };
+    // Without the extended flag Insert arrives as numpad 0.
+    if vk == VK_INSERT {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: vk,
-                dwFlags: if up {
-                    KEYEVENTF_KEYUP
-                } else {
-                    KEYBD_EVENT_FLAGS(0)
-                },
+                dwFlags: flags,
                 ..Default::default()
             },
         },
@@ -39,9 +45,32 @@ pub fn mask_modifier_release() {
     }
 }
 
-/// Sends Ctrl+C, first releasing modifiers still physically held so the target
-/// does not receive Ctrl+Alt+C or similar. One atomic batch.
+/// Window classes of terminals, where Ctrl+C without a selection interrupts the
+/// running program; they all copy on Ctrl+Insert instead.
+const TERMINAL_CLASSES: &[&str] = &[
+    "ConsoleWindowClass",
+    "CASCADIA_HOSTING_WINDOW_CLASS",
+    "mintty",
+    "VirtualConsoleClass",
+    "PuTTY",
+    "org.wezfurlong.wezterm",
+];
+
+fn foreground_is_terminal() -> bool {
+    let mut buffer = [0u16; 64];
+    let length = unsafe { GetClassNameW(GetForegroundWindow(), &mut buffer) };
+    let class = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
+    TERMINAL_CLASSES.contains(&class.as_str())
+}
+
+/// Sends the copy shortcut, first releasing modifiers still physically held so the
+/// target does not receive Ctrl+Alt+C or similar. One atomic batch.
 pub fn send_copy() {
+    let letter = if foreground_is_terminal() {
+        VK_INSERT
+    } else {
+        VK_C
+    };
     let mut inputs: Vec<INPUT> = [VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL]
         .into_iter()
         .filter(|&vk| is_down(vk))
@@ -49,8 +78,8 @@ pub fn send_copy() {
         .collect();
     inputs.extend([
         key(VK_CONTROL, false),
-        key(VK_C, false),
-        key(VK_C, true),
+        key(letter, false),
+        key(letter, true),
         key(VK_CONTROL, true),
     ]);
     send(&inputs);

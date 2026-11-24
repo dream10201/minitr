@@ -108,7 +108,7 @@ pub fn run() {
             let tray = match tray::install(commands) {
                 Ok(tray) => Some(tray),
                 Err(error) => {
-                    eprintln!("tray icon unavailable: {error:#}");
+                    log::error!("tray icon unavailable: {error:#}");
                     None
                 }
             };
@@ -173,7 +173,7 @@ impl Controller {
             };
             let _ = tray.set_tooltip(Some(tooltip));
         }
-        self.listener = Some(listener?);
+        self.listener = Some(listener.inspect_err(|error| log::error!("{error:#}"))?);
         Ok(())
     }
 
@@ -191,7 +191,7 @@ impl Controller {
             None => match open_popup(cx) {
                 Ok(created) => self.popup.insert(created).clone(),
                 Err(error) => {
-                    eprintln!("cannot open the translator window: {error:#}");
+                    log::error!("cannot open the translator window: {error:#}");
                     return;
                 }
             },
@@ -233,7 +233,7 @@ impl Controller {
         }) {
             Ok((window, _)) => self.preferences = Some(window),
             Err(error) => {
-                eprintln!("cannot open settings: {error:#}");
+                log::error!("cannot open settings: {error:#}");
                 let _ = self.arm(cx);
             }
         }
@@ -278,15 +278,17 @@ async fn update_loop(cx: &mut gpui_kit::AsyncApp) {
     loop {
         let (enabled, client) =
             cx.update(|cx| (config(cx).auto_check_update, router(cx).client().clone()));
-        if enabled
-            && let Ok(Some(pending)) =
-                runtime::spawn(async move { update::check_and_download(&client, |_| {}).await })
-                    .await
-        {
-            cx.update(|cx| {
-                cx.set_global(UpdateState(Some(pending)));
-                cx.refresh_windows();
-            });
+        if enabled {
+            match runtime::spawn(async move { update::check_and_download(&client, |_| {}).await })
+                .await
+            {
+                Ok(Some(pending)) => cx.update(|cx| {
+                    cx.set_global(UpdateState(Some(pending)));
+                    cx.refresh_windows();
+                }),
+                Ok(None) => {}
+                Err(error) => log::warn!("update check failed: {error:#}"),
+            }
         }
         timer(Duration::from_secs(60 * 60)).await;
     }
