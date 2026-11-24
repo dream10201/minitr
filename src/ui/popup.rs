@@ -161,10 +161,9 @@ impl Popup {
         {
             // Queued behind the activation, which applies the framework's own
             // initial placement first.
-            let scale = window.scale_factor();
-            let size = window.viewport_size();
-            let physical = |value: gpui_kit::Pixels| (value.as_f32() * scale).round() as i32;
-            let (width, height) = (physical(size.width), physical(size.height));
+            let (width, measured) = self.fitted.get();
+            let width = width.max(physical(WIDTH, window));
+            let height = measured.max(physical(MIN_HEIGHT, window));
             cx.spawn(async move |_, _| handle.fit(width, height, true))
                 .detach();
         }
@@ -376,16 +375,18 @@ impl Popup {
         }
     }
 
-    /// Sizes the native window to the content: the canvas fills the root, so its
-    /// bounds are the content's natural size.
+    /// Sizes the native window to the content. The canvas fills a wrapper without
+    /// border or padding, so its height is the content's natural height; the width
+    /// is fixed and never derived from the window, which would feed back on itself.
     fn measure(&self, window: &Window) -> impl IntoElement {
         let handle = self.handle;
         let fitted = self.fitted.clone();
+        let width = physical(WIDTH, window);
         let scale = window.scale_factor();
         canvas(
             move |bounds, _, cx| {
-                let physical = |value: gpui_kit::Pixels| (value.as_f32() * scale).round() as i32;
-                let size = (physical(bounds.size.width), physical(bounds.size.height));
+                let height = (bounds.size.height.as_f32() * scale).round() as i32;
+                let size = (width, height);
                 if let Some(handle) = handle
                     && fitted.replace(size) != size
                 {
@@ -515,17 +516,12 @@ impl Render for Popup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let has_output = !self.output.is_empty() || matches!(self.phase, Phase::Failed(_));
-        v_flex()
-            .key_context(CONTEXT)
-            .on_action(cx.listener(|this, _: &Hide, window, cx| this.hide(window, cx)))
-            .on_action(cx.listener(|this, _: &Speak, _, _| this.speak()))
-            .relative()
+        let content = v_flex()
             .w_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .border_1()
             .border_color(theme.border)
-            .child(self.measure(window))
             .child(div().h(px(8.)).window_control_area(WindowControlArea::Drag))
             .child(
                 div()
@@ -533,8 +529,20 @@ impl Render for Popup {
                     .child(Textarea::new(&self.input).appearance(false)),
             )
             .when(has_output, |root| root.child(self.render_output(cx)))
-            .child(self.render_footer(cx))
+            .child(self.render_footer(cx));
+        div()
+            .key_context(CONTEXT)
+            .on_action(cx.listener(|this, _: &Hide, window, cx| this.hide(window, cx)))
+            .on_action(cx.listener(|this, _: &Speak, _, _| this.speak()))
+            .relative()
+            .w(px(WIDTH))
+            .child(self.measure(window))
+            .child(content)
     }
+}
+
+fn physical(logical: f32, window: &Window) -> i32 {
+    (logical * window.scale_factor()).round() as i32
 }
 
 /// Holds the user's clipboard while a simulated copy borrows it and puts it back
