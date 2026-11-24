@@ -159,21 +159,32 @@ impl Popup {
     }
 
     pub fn show(&mut self, translate_clipboard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let appearing = !self.visible;
         if let Some(handle) = self.handle {
-            // Showing re-enters the framework, which may be borrowed here.
-            cx.spawn(async move |_, _| handle.show()).detach();
+            // Showing re-enters the framework, which may be borrowed here. An
+            // appearing window stays cloaked until it sits at the cursor.
+            cx.spawn(async move |_, _| {
+                if appearing {
+                    handle.cloak(true);
+                }
+                handle.show();
+            })
+            .detach();
         }
         window.activate_window();
         if let Some(handle) = self.handle
-            && !self.visible
+            && appearing
         {
             // Queued behind the activation, which applies the framework's own
             // initial placement the first time.
             let (width, measured) = self.fitted.get();
             let width = width.max(physical(WIDTH, window));
             let height = measured.max(physical(MIN_HEIGHT, window));
-            cx.spawn(async move |_, _| handle.fit(width, height, true))
-                .detach();
+            cx.spawn(async move |_, _| {
+                handle.fit(width, height, true);
+                handle.cloak(false);
+            })
+            .detach();
         }
         self.visible = true;
         self.input.update(cx, |input, cx| {

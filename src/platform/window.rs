@@ -1,10 +1,10 @@
-//! Direct control over the translator popup's native window: the framework has no
-//! hide/show or placement API for it.
+//! Direct control over native windows where the framework has no hide/show or
+//! placement API.
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMWA_CLOAK, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
@@ -14,6 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowRect, SW_HIDE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow,
 };
+use windows::core::BOOL;
 
 /// `HWND` is not `Send`, and the popup handle never leaves the UI thread; this keeps
 /// it plain data so it can be captured by UI callbacks.
@@ -38,6 +39,19 @@ impl Handle {
 
     pub fn hide(self) {
         let _ = unsafe { ShowWindow(self.hwnd(), SW_HIDE) };
+    }
+
+    /// A cloaked window is shown and active but not drawn on screen.
+    pub fn cloak(self, cloaked: bool) {
+        let value = BOOL::from(cloaked);
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                self.hwnd(),
+                DWMWA_CLOAK,
+                (&raw const value).cast(),
+                size_of_val(&value) as u32,
+            )
+        };
     }
 
     pub fn is_foreground(self) -> bool {
