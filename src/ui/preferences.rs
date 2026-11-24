@@ -28,8 +28,9 @@ use crate::settings::{INTERVAL_RANGE, Profile, Settings};
 use crate::translate::Language;
 use crate::{runtime, translate, update};
 
-/// Hides the window before the framework removes it, so the deactivation that
-/// hiding causes arrives while the framework still knows the window.
+/// Hides the window before the framework removes it. Hiding deactivates it, and the
+/// framework handles that in a task it queues then; removal is queued after it so
+/// the window still exists when that task runs.
 fn close(window: &mut Window, cx: &mut App) {
     let native = Handle::of(window);
     let handle = window.window_handle();
@@ -37,7 +38,10 @@ fn close(window: &mut Window, cx: &mut App) {
         if let Some(native) = native {
             native.hide();
         }
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        cx.spawn(async move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        })
+        .detach();
     })
     .detach();
 }
