@@ -47,7 +47,7 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
         trigger.SetUserId(&BSTR::from(current_user()))?;
         let action: IExecAction = task.Actions()?.Create(TASK_ACTION_EXEC)?.cast()?;
         action.SetPath(&BSTR::from(
-            crate::update::base_exe()
+            std::env::current_exe()?
                 .as_os_str()
                 .to_string_lossy()
                 .as_ref(),

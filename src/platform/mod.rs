@@ -2,6 +2,7 @@
 
 pub mod autostart;
 pub mod clipboard;
+pub mod elevate;
 pub mod input;
 pub mod instance;
 pub mod selection;

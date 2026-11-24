@@ -20,13 +20,14 @@ use gpui_kit::{
     WindowControlArea, actions, canvas, div, px,
 };
 
-use super::{Command, UpdateState, config, restart_into, send};
+use super::{Command, UpdateState, config, send};
 use crate::platform::clipboard::{self, Snapshot};
 use crate::platform::speech::Speaker;
 use crate::platform::window::Handle;
 use crate::platform::{input, selection};
 use crate::runtime;
 use crate::translate::{Language, Translation, is_mainly_chinese, normalize_input};
+use crate::update::Pending;
 
 actions!(popup, [Hide, Speak]);
 
@@ -77,6 +78,7 @@ pub struct Popup {
     fitted: Rc<Cell<(i32, i32)>>,
     translation: Option<Task<()>>,
     capture: Option<Task<()>>,
+    installing: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -138,6 +140,7 @@ impl Popup {
             fitted: Rc::default(),
             translation: None,
             capture: None,
+            installing: None,
             _subscriptions: subscriptions,
         }
     }
@@ -251,12 +254,15 @@ impl Popup {
             let lease = ClipboardLease::take(seen.clone());
             input::send_copy();
 
-            // Only a clipboard write after our shortcut counts: the old content must
-            // not be mistaken for the selection. The retry goes out while the target
-            // still has focus.
+            // A clipboard write after our shortcut is the selection. Without one, the
+            // app may already have copied it on select (tmux, PuTTY, some terminals):
+            // content that arrived since the last capture is used instead. Content
+            // already seen is never mistaken for the selection.
+            let unseen_before = lease.sequence != seen.get();
             let mut shown = false;
             for attempt in 0..30 {
-                if lease.changed() {
+                let fallback = !lease.changed() && attempt == 10 && unseen_before;
+                if lease.changed() || fallback {
                     shown = shown || show(cx);
                     if let Some(text) = clipboard::text().filter(|text| !text.trim().is_empty()) {
                         seen.set(clipboard::sequence_number());
@@ -379,6 +385,19 @@ impl Popup {
         }
     }
 
+    fn install_update(&mut self, pending: Pending, cx: &mut Context<Self>) {
+        let installing = super::install_update(pending, cx);
+        self.installing = Some(cx.spawn(async move |this, cx| {
+            let result = installing.await;
+            let _ = this.update(cx, |this, cx| {
+                this.installing = None;
+                this.notice = result.err().map(|error| format!("{error:#}").into());
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     fn speak(&mut self, cx: &mut Context<Self>) {
         let Some(text) = &self.speak_text else { return };
         let speaking = self.speaker.speak(text, self.language.tag());
@@ -490,10 +509,11 @@ impl Popup {
                     Button::new("restart")
                         .ghost()
                         .xsmall()
-                        .label(format!("{} 已就绪，重启更新", pending.version))
-                        .on_click(move |_, _, cx| {
-                            let _ = restart_into(&pending, cx);
-                        }),
+                        .label(format!("{} 已就绪，点击更新", pending.version))
+                        .loading(self.installing.is_some())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.install_update(pending.clone(), cx)
+                        })),
                 )
             })
             .child(

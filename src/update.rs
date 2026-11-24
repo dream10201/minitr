@@ -1,8 +1,6 @@
 use std::fmt;
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
 use std::{env, fs};
 
 use anyhow::{Context as _, Result, bail};
@@ -44,47 +42,25 @@ impl fmt::Display for Version {
     }
 }
 
-/// A newer version already unpacked next to the running one.
+/// A downloaded release waiting to be installed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pending {
     pub version: Version,
-    pub exe: PathBuf,
+    exe: PathBuf,
 }
 
 pub fn enabled() -> bool {
     !cfg!(debug_assertions)
 }
 
-/// `%LocalAppData%\MiniTranslation\app\<version>\MiniTranslation.exe`
-fn versions_dir() -> PathBuf {
-    crate::settings::local_data_dir().join("app")
-}
-
-static BASE_EXE: OnceLock<PathBuf> = OnceLock::new();
-
-/// Records the installed executable this process was started on behalf of.
-pub fn init_base(args: &[String]) {
-    if let Some(path) = args
-        .iter()
-        .position(|a| a == "--base")
-        .and_then(|i| args.get(i + 1))
-    {
-        let _ = BASE_EXE.set(PathBuf::from(path));
-    }
-}
-
-/// The installed executable, even when running from a version directory.
-pub fn base_exe() -> PathBuf {
-    BASE_EXE
-        .get()
-        .cloned()
-        .or_else(|| env::current_exe().ok())
-        .unwrap_or_else(|| PathBuf::from(EXE_NAME))
+/// `%LocalAppData%\MiniTranslation\update\<version>\MiniTranslation.exe`
+fn downloads_dir() -> PathBuf {
+    crate::settings::local_data_dir().join("update")
 }
 
 pub fn pending() -> Option<Pending> {
     let current = Version::current();
-    fs::read_dir(versions_dir())
+    fs::read_dir(downloads_dir())
         .ok()?
         .flatten()
         .filter_map(|entry| {
@@ -95,64 +71,77 @@ pub fn pending() -> Option<Pending> {
         .max_by_key(|pending| pending.version)
 }
 
-/// The caller should exit afterwards; the new process waits for the instance lock.
-pub fn launch(pending: &Pending) -> io::Result<()> {
-    Command::new(&pending.exe)
-        .arg("--base")
-        .arg(base_exe())
-        .spawn()
-        .map(drop)
+fn retired(exe: &Path) -> PathBuf {
+    exe.with_extension("exe.old")
 }
 
-/// Hands over to a newer unpacked version if there is one; returns whether it did.
-pub fn launch_newer_at_startup() -> bool {
-    if !enabled() {
-        return false;
+/// Removes what an earlier update left behind: the replaced executable and
+/// downloads that are not newer than the running version.
+pub fn clean_up() {
+    if let Ok(exe) = env::current_exe() {
+        let _ = fs::remove_file(retired(&exe));
     }
-    match pending() {
-        Some(pending) => launch(&pending).is_ok(),
-        None => {
-            remove_stale_versions();
-            false
-        }
-    }
-}
-
-fn remove_stale_versions() {
-    let Ok(entries) = fs::read_dir(versions_dir()) else {
+    let downloads = pending().map(|pending| downloads_dir().join(pending.version.to_string()));
+    let Ok(entries) = fs::read_dir(downloads_dir()) else {
         return;
     };
-    let own_dir = env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let current = Version::current();
     for entry in entries.flatten() {
-        let path = entry.path();
-        let newer = entry
-            .file_name()
-            .to_str()
-            .and_then(Version::parse)
-            .is_some_and(|v| v > current);
-        if !newer && own_dir.as_deref() != Some(path.as_path()) {
-            let _ = if path.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            };
+        if downloads.as_deref() != Some(entry.path().as_path()) {
+            let _ = fs::remove_dir_all(entry.path());
         }
     }
 }
 
-/// Run elevated at logon by the installer's task: copies the newest unpacked version
-/// over the installed executable. Only copies, never executes user-writable files.
-pub fn sync_base() {
-    let Ok(base) = env::current_exe() else { return };
-    let retired = base.with_extension("exe.old");
-    let _ = fs::remove_file(&retired);
-    let Some(pending) = pending() else { return };
-    // A running executable cannot be overwritten but can be renamed.
-    if fs::rename(&base, &retired).is_ok() && fs::copy(&pending.exe, &base).is_err() {
-        let _ = fs::rename(&retired, &base);
+/// Puts `source` in place of `target`. A running executable cannot be overwritten
+/// but can be renamed, so the old one moves aside and is deleted on next start.
+fn replace(source: &Path, target: &Path) -> io::Result<()> {
+    let old = retired(target);
+    let _ = fs::remove_file(&old);
+    fs::rename(target, &old)?;
+    fs::copy(source, target).map(drop).inspect_err(|_| {
+        let _ = fs::rename(&old, target);
+    })
+}
+
+/// Installs `pending` over the running executable, asking for administrator
+/// rights when its directory is not writable. Blocks until done and returns the
+/// executable to start.
+pub fn install(pending: &Pending) -> Result<PathBuf> {
+    let target = env::current_exe()?;
+    match replace(&pending.exe, &target) {
+        Ok(()) => Ok(target),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            install_elevated(&target, &pending.exe)?;
+            Ok(target)
+        }
+        Err(error) => Err(error).context("无法替换程序文件"),
+    }
+}
+
+/// Runs the installed, administrator-protected copy of this program with
+/// `--install`; the downloaded file is only copied, never executed elevated.
+#[cfg(windows)]
+fn install_elevated(target: &Path, source: &Path) -> Result<()> {
+    let parameters = format!("--install \"{}\"", source.display());
+    match crate::platform::elevate::run_as_admin(target, &parameters)? {
+        0 => Ok(()),
+        code => bail!("安装更新失败（代码 {code}）"),
+    }
+}
+
+#[cfg(not(windows))]
+fn install_elevated(_: &Path, _: &Path) -> Result<()> {
+    bail!("无权写入安装目录")
+}
+
+/// Entry point of the elevated `--install <source>` process; returns the exit code.
+pub fn install_here(source: &Path) -> i32 {
+    match env::current_exe().and_then(|target| replace(source, &target)) {
+        Ok(()) => 0,
+        Err(error) => {
+            log::error!("installing {} failed: {error}", source.display());
+            1
+        }
     }
 }
 
@@ -240,7 +229,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Unpacks into a staging directory first so a half-written version is never picked up.
 fn unpack(archive: &[u8], version: Version) -> Result<PathBuf> {
-    let root = versions_dir();
+    let root = downloads_dir();
     let staging = root.join("staging");
     let _ = fs::remove_dir_all(&staging);
     zip::ZipArchive::new(Cursor::new(archive))
@@ -270,6 +259,20 @@ mod tests {
         assert!(Version::parse("staging").is_none());
         assert!(Version::parse("1").is_none());
         assert!(Version::parse("1.2.3.4.5").is_none());
+    }
+
+    #[test]
+    fn replace_keeps_the_old_file_aside() {
+        let dir = std::env::temp_dir().join(format!("minits-replace-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (source, target) = (dir.join("new.exe"), dir.join("app.exe"));
+        fs::write(&source, "new").unwrap();
+        fs::write(&target, "old").unwrap();
+        replace(&source, &target).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(fs::read_to_string(retired(&target)).unwrap(), "old");
+        replace(&source, &dir.join("missing.exe")).unwrap_err();
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -19,7 +19,7 @@ use gpui_kit::{
     Styled as _, Subscription, Task, Window, div, px,
 };
 
-use super::{Command, Config, UpdateState, config, restart_into, router, send};
+use super::{Command, Config, UpdateState, config, install_update, router, send};
 use crate::hotkey::{Modifier, Trigger};
 use crate::platform::{autostart, input, trigger};
 use crate::settings::{INTERVAL_RANGE, Profile, Settings};
@@ -252,9 +252,17 @@ impl Preferences {
             return self.set_status("调试版本不检查更新。", true, cx);
         }
         if let Some(pending) = cx.global::<UpdateState>().0.clone() {
-            if let Err(error) = restart_into(&pending, cx) {
-                self.set_status(format!("无法启动新版本：{error}"), true, cx);
-            }
+            self.set_status("正在安装更新…", false, cx);
+            let installing = install_update(pending, cx);
+            self.updating = Some(cx.spawn(async move |this, cx| {
+                let result = installing.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.updating = None;
+                    if let Err(error) = result {
+                        this.set_status(format!("{error:#}"), true, cx);
+                    }
+                });
+            }));
             return;
         }
         self.set_status("检查更新中…", false, cx);
@@ -278,10 +286,7 @@ impl Preferences {
                 match result {
                     Ok(None) => this.set_status("已是最新版本。", false, cx),
                     Ok(Some(pending)) => {
-                        let text = format!(
-                            "{} 已就绪，点击“立即更新”或下次启动时生效。",
-                            pending.version
-                        );
+                        let text = format!("{} 已下载，点击“立即更新”安装。", pending.version);
                         cx.set_global(UpdateState(Some(pending)));
                         this.set_status(text, false, cx);
                     }

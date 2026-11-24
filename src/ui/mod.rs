@@ -6,12 +6,13 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui_kit::component::Theme;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, AssetSource, Bounds, Entity, Global, QuitMode,
-    SharedString, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowKind,
+    SharedString, Task, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowKind,
     WindowOptions, px, size,
 };
 
@@ -61,10 +62,20 @@ fn router(cx: &App) -> Arc<Router> {
     cx.global::<Services>().router.clone()
 }
 
-fn restart_into(pending: &Pending, cx: &mut App) -> anyhow::Result<()> {
-    update::launch(pending)?;
-    send(cx, Command::Quit);
-    Ok(())
+/// Installs the downloaded release, after a UAC prompt when the install directory
+/// needs it, then hands over to the new executable.
+fn install_update(pending: Pending, cx: &mut App) -> Task<anyhow::Result<()>> {
+    cx.spawn(async move |cx| {
+        let installed = cx.background_spawn(async move { update::install(&pending) });
+        let exe = installed
+            .await
+            .inspect_err(|error| log::error!("{error:#}"))?;
+        std::process::Command::new(&exe)
+            .spawn()
+            .context("无法启动新版本")?;
+        cx.update(|cx| send(cx, Command::Quit));
+        Ok(())
+    })
 }
 
 gpui_kit::assets::icon_assets!(ExtraIcons, [Volume2, Pin, PinOff, Keyboard, Mouse]);
@@ -103,7 +114,9 @@ pub fn run() {
                 commands: commands.clone(),
             });
             cx.set_global(Config(settings));
-            cx.set_global(UpdateState::default());
+            cx.set_global(UpdateState(
+                update::enabled().then(update::pending).flatten(),
+            ));
 
             let tray = match tray::install(commands) {
                 Ok(tray) => Some(tray),
