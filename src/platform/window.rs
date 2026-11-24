@@ -58,6 +58,13 @@ impl Handle {
         unsafe { GetForegroundWindow() == self.hwnd() }
     }
 
+    /// Client area in physical pixels.
+    pub fn client_size(self) -> Option<(i32, i32)> {
+        let mut client = RECT::default();
+        unsafe { GetClientRect(self.hwnd(), &mut client) }.ok()?;
+        Some((client.right, client.bottom))
+    }
+
     /// Windows 11 rounded corners; older systems ignore the request.
     pub fn round_corners(self) {
         let preference = DWMWCP_ROUND;

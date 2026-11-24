@@ -76,8 +76,8 @@ pub struct Popup {
     /// Clipboard sequence number already consumed, so showing the window only
     /// translates content that is new since.
     clipboard_seen: Rc<Cell<u32>>,
-    /// Last client size requested from the platform, in physical pixels.
-    fitted: Rc<Cell<(i32, i32)>>,
+    /// Content size last measured, in physical pixels.
+    measured: Rc<Cell<(i32, i32)>>,
     translation: Option<Task<()>>,
     capture: Option<Task<()>>,
     installing: Option<Task<()>>,
@@ -139,7 +139,7 @@ impl Popup {
             speaker: Speaker::new(),
             speech: None,
             clipboard_seen: Rc::default(),
-            fitted: Rc::default(),
+            measured: Rc::default(),
             translation: None,
             capture: None,
             installing: None,
@@ -179,9 +179,13 @@ impl Popup {
         {
             // Queued behind the activation, which applies the framework's own
             // initial placement the first time.
-            let (width, measured) = self.fitted.get();
+            let (width, measured) = self.measured.get();
             let width = width.max(physical(WIDTH, window));
-            let height = measured.max(physical(MIN_HEIGHT, window));
+            let height = if measured > 0 {
+                measured
+            } else {
+                physical(MIN_HEIGHT, window)
+            };
             cx.spawn(async move |_, _| {
                 handle.fit(width, height, true);
                 handle.cloak(false);
@@ -439,17 +443,20 @@ impl Popup {
     /// Sizes the native window to the content. The canvas fills a wrapper without
     /// border or padding, so its height is the content's natural height; the width
     /// is fixed and never derived from the window, which would feed back on itself.
+    /// Compared with the actual client area, so a resize from elsewhere (placement,
+    /// DPI change) is undone on the frame it causes.
     fn measure(&self, window: &Window) -> impl IntoElement {
         let handle = self.handle;
-        let fitted = self.fitted.clone();
+        let measured = self.measured.clone();
         let width = physical(WIDTH, window);
         let scale = window.scale_factor();
         canvas(
             move |bounds, _, cx| {
                 let height = (bounds.size.height.as_f32() * scale).round() as i32;
                 let size = (width, height);
+                measured.set(size);
                 if let Some(handle) = handle
-                    && fitted.replace(size) != size
+                    && handle.client_size() != Some(size)
                 {
                     // Deferred to the event loop: resizing re-enters the framework.
                     cx.spawn(async move |_| handle.fit(size.0, size.1, false))
