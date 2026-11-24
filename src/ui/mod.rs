@@ -165,7 +165,9 @@ impl Controller {
             Command::Quit => {
                 self.listener = None;
                 self.tray = None;
-                cx.quit();
+                // The framework's quit does not always end the run loop, and an
+                // updated instance waits for this process to exit.
+                std::process::exit(0);
             }
         }
     }
