@@ -1,9 +1,10 @@
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_INSERT, VK_LWIN,
-    VK_MBUTTON, VK_MENU, VK_RWIN, VK_SHIFT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, SendInput,
+    VIRTUAL_KEY, VK_CONTROL, VK_INSERT, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 
 use crate::hotkey::{Key, Modifiers, Trigger};
@@ -12,14 +13,17 @@ fn is_down(vk: VIRTUAL_KEY) -> bool {
     unsafe { GetAsyncKeyState(vk.0.into()) as u16 & 0x8000 != 0 }
 }
 
+/// A key event as a keyboard would produce it: input methods and apps that go by
+/// the scan code do not recognise a modifier that arrives without one.
 fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+    let scan = unsafe { MapVirtualKeyW(vk.0.into(), MAPVK_VK_TO_VSC_EX) };
     let mut flags = if up {
         KEYEVENTF_KEYUP
     } else {
         KEYBD_EVENT_FLAGS(0)
     };
     // Without the extended flag Insert arrives as numpad 0.
-    if vk == VK_INSERT {
+    if vk == VK_INSERT || scan >> 8 == 0xE0 {
         flags |= KEYEVENTF_EXTENDEDKEY;
     }
     INPUT {
@@ -27,6 +31,7 @@ fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: vk,
+                wScan: (scan & 0xFF) as u16,
                 dwFlags: flags,
                 ..Default::default()
             },
@@ -46,23 +51,25 @@ pub fn mask_modifier_release() {
     }
 }
 
-/// Sends Ctrl+`vk`. Modifiers still physically held are released first so the
-/// target does not see Ctrl+Alt+Insert or similar. Ctrl stays down for a moment
-/// on both sides of the key: input methods and apps that read the live key state
-/// while handling it would otherwise see a bare key and type it.
+/// Sends Ctrl+`vk`. Ctrl and the key go down in one batch, which no other input,
+/// a physical key release included, can interleave with; modifiers still held are
+/// released in it so the target does not see Ctrl+Alt+Insert or similar. Ctrl is
+/// released only a moment later, for input methods and apps that read the live key
+/// state while handling the key. Calls never overlap, so one cannot release Ctrl
+/// under another.
 pub fn send_ctrl(vk: VIRTUAL_KEY) {
-    const HOLD: Duration = Duration::from_millis(30);
-    let mut inputs: Vec<INPUT> = [VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL]
-        .into_iter()
-        .filter(|&vk| is_down(vk))
-        .map(|vk| key(vk, true))
-        .collect();
-    inputs.push(key(VK_CONTROL, false));
-    send(&inputs);
+    const HOLD: Duration = Duration::from_millis(50);
+    static SENDING: Mutex<()> = Mutex::new(());
     // On its own thread so that a cancelled capture cannot leave Ctrl held down.
     std::thread::spawn(move || {
-        std::thread::sleep(HOLD);
-        send(&[key(vk, false), key(vk, true)]);
+        let _sending = SENDING.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut inputs: Vec<INPUT> = [VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+            .into_iter()
+            .filter(|&vk| is_down(vk))
+            .map(|vk| key(vk, true))
+            .collect();
+        inputs.extend([key(VK_CONTROL, false), key(vk, false), key(vk, true)]);
+        send(&inputs);
         std::thread::sleep(HOLD);
         send(&[key(VK_CONTROL, true)]);
     });
@@ -76,7 +83,11 @@ pub fn trigger_held(trigger: Trigger) -> bool {
             [VK_MENU, VK_CONTROL, VK_SHIFT].into_iter().any(is_down)
                 || is_down(VIRTUAL_KEY(key.vk()))
         }
-        Trigger::DoubleTap(_) => [VK_MENU, VK_CONTROL, VK_SHIFT].into_iter().any(is_down),
+        // The detector fires from inside the hook, before the press reaches the
+        // live key state.
+        Trigger::DoubleTap(_) => {
+            super::trigger::tap_held() || [VK_MENU, VK_CONTROL, VK_SHIFT].into_iter().any(is_down)
+        }
     }
 }
 

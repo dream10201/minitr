@@ -313,6 +313,10 @@ impl DoubleTap {
         }
     }
 
+    pub fn held(&self) -> bool {
+        self.held
+    }
+
     /// Feeds one key event (`time` in milliseconds); returns whether the trigger fires.
     pub fn key(&mut self, vk: u32, down: bool, time: u32) -> bool {
         if !self.modifier.matches_vk(vk) {

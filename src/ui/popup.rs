@@ -250,8 +250,16 @@ impl Popup {
                 this.update_in(cx, |this, window, cx| this.show(false, window, cx))
                     .is_ok()
             };
+            // A simulated copy must not race the user still letting go of the trigger.
+            let released = async || {
+                for _ in 0..10 {
+                    if !input::trigger_held(trigger) {
+                        break;
+                    }
+                    sleep(30).await;
+                }
+            };
             let mut shown = false;
-            let mut released = false;
             let mut text = String::new();
             for (index, &method) in methods.iter().enumerate() {
                 text = match method {
@@ -262,13 +270,7 @@ impl Popup {
                         _ = sleep(300).fuse() => String::new(),
                     },
                     Capture::CtrlInsert | Capture::CtrlC => {
-                        for _ in 0..10 {
-                            if released || !input::trigger_held(trigger) {
-                                break;
-                            }
-                            sleep(30).await;
-                        }
-                        released = true;
+                        released().await;
                         let vk = if method == Capture::CtrlC {
                             VK_C
                         } else {
@@ -291,6 +293,7 @@ impl Popup {
                                     break;
                                 }
                             } else if attempt == 3 {
+                                released().await;
                                 input::send_ctrl(vk);
                             }
                             if last && attempt == 6 && !shown {

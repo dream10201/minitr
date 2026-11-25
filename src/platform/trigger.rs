@@ -124,6 +124,13 @@ fn feed(detect: impl FnOnce(&mut Detector) -> bool) {
     }
 }
 
+/// Whether the double-tapped modifier is physically down, as last seen by the hook.
+pub fn tap_held() -> bool {
+    ACTIVE.with_borrow(|active| {
+        matches!(active, Some(Active { detector: Detector::Keyboard(_, tap), .. }) if tap.held())
+    })
+}
+
 pub(super) fn on_hotkey(id: i32) {
     if id == HOTKEY_ID {
         feed(|detector| matches!(detector, Detector::HotKey));
