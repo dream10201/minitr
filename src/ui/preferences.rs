@@ -694,7 +694,31 @@ impl Preferences {
                     .loading(self.updating.is_some())
                     .on_click(cx.listener(|this, _, _, cx| this.check_update(cx))),
             )
+            .child(open_folder(
+                "open-logs",
+                "日志文件夹",
+                crate::settings::local_data_dir(),
+            ))
+            .child(open_folder(
+                "open-settings",
+                "设置文件夹",
+                Settings::path()
+                    .parent()
+                    .map(Into::into)
+                    .unwrap_or_default(),
+            ))
     }
+}
+
+fn open_folder(id: &'static str, label: &'static str, dir: std::path::PathBuf) -> Button {
+    Button::new(id)
+        .outline()
+        .small()
+        .label(label)
+        .on_click(move |_, _, cx| {
+            let _ = std::fs::create_dir_all(&dir);
+            cx.open_with_system(&dir);
+        })
 }
 
 fn section(title: &'static str, body: impl IntoElement, cx: &Context<Preferences>) -> AnyElement {
